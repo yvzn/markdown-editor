@@ -636,7 +636,7 @@ impl App {
         show(self.search.edit, show_side && self.panel == Panel::Search);
         move_window(self.search.tree, &rect(0, l.search_status.bottom + self.px(2.0), sw, h));
         show(self.search.tree, show_side && self.panel == Panel::Search);
-        move_window(self.outline.tree, &rect(0, body_top + self.px(4.0), sw, h));
+        move_window(self.outline.tree, &panel_rect_tree);
         show(self.outline.tree, show_side && self.panel == Panel::Outline);
 
         if self.find.visible {
@@ -749,7 +749,17 @@ impl App {
                     self.button(p, rx, Hit::SearchRegex, ".*", self.fonts.small, self.search.regex && exact, exact, pal.side);
                     p.text(&self.search.status, &l.search_status, pal.fg_dim, self.fonts.small, LEFT_MID);
                 }
-                Panel::Outline => {}
+                Panel::Outline => {
+                    // Header strip with the same geometry as the Files one.
+                    let head = l.files_head;
+                    let r = rect(head.left + self.px(14.0), head.top + self.px(5.0), head.right - self.px(16.0), head.bottom - self.px(5.0));
+                    p.text("Headings", &r, pal.fg, self.fonts.ui_bold, LEFT_MID);
+                    if !self.headings.is_empty() {
+                        let n = self.headings.len().to_string();
+                        let w = p.text_width(&n, self.fonts.small);
+                        p.text(&n, &rect(r.right - w, r.top, r.right, r.bottom), pal.fg_dim, self.fonts.small, LEFT_MID);
+                    }
+                }
             }
             self.hits.push((rect(l.side.right - self.px(3.0), 0, l.side.right + self.px(3.0), cr.bottom), Hit::SideSplitter));
         }

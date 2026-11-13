@@ -356,7 +356,8 @@ pub struct OutlinePanel {
 
 impl OutlinePanel {
     pub fn create(parent: HWND) -> OutlinePanel {
-        OutlinePanel { tree: make_tree(parent, ID_OUTLINE_TREE, false), items: Vec::new(), active: None, programmatic: false }
+        // Same tree style as Files / Search: root indent, collapsible sections.
+        OutlinePanel { tree: make_tree(parent, ID_OUTLINE_TREE, true), items: Vec::new(), active: None, programmatic: false }
     }
 
     pub fn apply_theme(&self, p: &Palette) {
