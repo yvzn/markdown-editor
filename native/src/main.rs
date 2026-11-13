@@ -13,6 +13,7 @@ mod fuzzy;
 mod help;
 mod markdown;
 mod mermaid;
+mod nav;
 mod palette;
 mod scrim;
 mod panels;

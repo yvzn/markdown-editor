@@ -1,5 +1,5 @@
-//! One overlay, three uses: quick open (Ctrl+P), go to heading (Ctrl+R),
-//! and a single-line prompt (new file name, go to line).
+//! One overlay, four uses: quick open (Ctrl+P), recent-file switcher (Ctrl+Tab),
+//! go to heading (Ctrl+R), and a single-line prompt (new file name, go to line).
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -24,6 +24,8 @@ pub enum Ask {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Files,
+    /// Ctrl+Tab: recent files, most recent first; releasing Ctrl opens the highlighted one.
+    Switch,
     Headings,
     Ask(Ask),
 }
@@ -238,6 +240,10 @@ impl PaletteUi {
         unsafe { InvalidateRect(self.list, std::ptr::null(), 1) };
     }
 
+    pub fn is_switcher(&self) -> bool {
+        self.open && self.kind == Kind::Switch
+    }
+
     fn move_sel(&mut self, delta: isize) {
         if self.items.is_empty() {
             return;
@@ -354,6 +360,25 @@ impl App {
         self.palette_update();
     }
 
+    /// Ctrl+Tab: the previous file is pre-selected (the last one with Shift), so a quick
+    /// Ctrl+Tab tap flips between the two most recent files.
+    pub fn open_switcher(&mut self, reverse: bool) {
+        if self.recent.iter().filter(|p| self.core.has_file(p)).count() < 2 {
+            return;
+        }
+        self.palette.show_with(Kind::Switch, "Recent files  ·  Tab to move, release Ctrl to open", "");
+        self.palette_update();
+        self.palette.move_sel(if reverse { -1 } else { 1 });
+    }
+
+    pub fn palette_step(&mut self, delta: isize) {
+        self.palette.move_sel(delta);
+    }
+
+    pub fn palette_pick(&mut self) {
+        self.palette_choose();
+    }
+
     pub fn open_heading_palette(&mut self) {
         self.palette.show_with(Kind::Headings, "Go to heading…", "");
         self.palette_update();
@@ -361,6 +386,10 @@ impl App {
 
     pub fn palette_update(&mut self) {
         let q = get_text(self.palette.edit).trim().to_string();
+        // Typing in the switcher turns it into plain quick open.
+        if self.palette.kind == Kind::Switch && !q.is_empty() {
+            self.palette.kind = Kind::Files;
+        }
         let items = match self.palette.kind {
             Kind::Files => {
                 let file_item = |path: &str, idx: &[u32]| {
@@ -385,6 +414,15 @@ impl App {
                     self.core.find_files(&q, 50).iter().map(|m| file_item(&m.path, &m.indices)).collect()
                 }
             }
+            Kind::Switch => self
+                .recent
+                .iter()
+                .filter(|p| self.core.has_file(p))
+                .map(|p| {
+                    let cut = p.rfind('/').map_or(0, |i| i + 1);
+                    Item { label: p[cut..].to_string(), detail: p[..cut].to_string(), label_idx: vec![], detail_idx: vec![], indent: 0, target: Target::File(p.clone()) }
+                })
+                .collect(),
             Kind::Headings => {
                 let min = self.headings.iter().map(|h| h.level).min().unwrap_or(1);
                 let mut all: Vec<(f64, Item)> = self

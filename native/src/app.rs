@@ -21,6 +21,7 @@ use crate::ffi::{self, PvAnchor};
 use crate::findbar::FindBar;
 use crate::markdown::{self, Heading};
 use crate::mermaid;
+use crate::nav::{History, Visit};
 use crate::help::HelpUi;
 use crate::palette::PaletteUi;
 use crate::paste;
@@ -77,6 +78,8 @@ enum Side {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     ToggleSidebar,
+    Back,
+    Forward,
     Title,
     Mode(Mode),
     Theme,
@@ -165,6 +168,13 @@ pub struct App {
     pub dirty: bool,
     pub mode: Mode,
     pub recent: Vec<String>,
+    history: History,
+    tip: HWND,
+    tip_text: Vec<u16>,
+    /// Rows of the open back / forward drop-down, drawn by us (bold file name, tight padding).
+    menu_rows: Vec<MenuRow>,
+    /// Alt+arrow navigated: swallow that Alt release so it doesn't open window-menu mode.
+    alt_nav: bool,
     pub panel: Panel,
     pub sidebar: bool,
     side_w: f32,
@@ -193,6 +203,20 @@ pub fn app() -> &'static mut App {
 /// False while the app is still being built (child windows already get messages then).
 pub fn app_ready() -> bool {
     unsafe { !APP.is_null() }
+}
+
+struct MenuRow {
+    name: String,
+    section: Option<String>,
+    dir: String,
+}
+
+/// A visit as people name it: "note.md › Section", or just the file name above the first heading.
+fn place(v: &Visit) -> String {
+    match &v.section {
+        Some(s) => format!("{}  \u{203A}  {s}", basename(&v.path)),
+        None => basename(&v.path).to_string(),
+    }
 }
 
 pub fn is_markdown(p: &str) -> bool {
@@ -419,6 +443,11 @@ impl App {
                 dirty: false,
                 mode: Mode::Preview, // every launch starts as a reader; Ctrl+1/2 switch to editing
                 recent: Vec::new(),
+                history: History::default(),
+                tip: create_tip(hwnd),
+                tip_text: Vec::new(),
+                alt_nav: false,
+                menu_rows: Vec::new(),
                 panel: Panel::Files,
                 sidebar: settings.get("sidebar") != Some("0"),
                 side_w: settings.get("sideWidth").and_then(|v| v.parse().ok()).unwrap_or(260.0),
@@ -732,6 +761,14 @@ impl App {
         let ty = tb.top + (tb.bottom - tb.top - ib) / 2;
         let toggle = rect(tb.left + self.px(8.0), ty, tb.left + self.px(8.0) + ib, ty + ib);
         self.button(p, toggle, Hit::ToggleSidebar, "\u{E90C}", self.fonts.icon, false, true, pal.bar);
+        // Back / forward sit where a browser puts them: left of the "address" (the file title).
+        // Dimmed, never hidden, when there is nowhere to go, so the title never shifts.
+        let back_r = rect(toggle.right + self.px(4.0), ty, toggle.right + self.px(4.0) + ib, ty + ib);
+        let fwd_r = rect(back_r.right + self.px(2.0), ty, back_r.right + self.px(2.0) + ib, ty + ib);
+        let (cb, cf) = (self.history.can_back(), self.history.can_fwd());
+        self.button(p, back_r, Hit::Back, "\u{E72B}", self.fonts.icon, false, cb, pal.bar);
+        self.button(p, fwd_r, Hit::Forward, "\u{E72A}", self.fonts.icon, false, cf, pal.bar);
+        self.place_tips(&back_r, &fwd_r);
 
         let theme_r = rect(tb.right - self.px(8.0) - ib, ty, tb.right - self.px(8.0), ty + ib);
         let glyph = match self.pref {
@@ -752,7 +789,7 @@ impl App {
             self.button(p, r, Hit::Mode(m), label, self.fonts.ui, md && m == mode, md, pal.bar);
             x -= w + self.px(2.0);
         }
-        let title_left = toggle.right + self.px(10.0);
+        let title_left = fwd_r.right + self.px(10.0);
         let title_right = x - self.px(12.0);
         if !crate::win::is_visible(self.rename_edit) {
             let title = self.current.clone().unwrap_or_default();
@@ -811,6 +848,8 @@ impl App {
     fn on_click(&mut self, hit: Hit, x: i32, y: i32) {
         match hit {
             Hit::ToggleSidebar => self.set_sidebar(!self.sidebar),
+            Hit::Back => self.navigate(true, 1),
+            Hit::Forward => self.navigate(false, 1),
             Hit::Title => self.start_rename(),
             Hit::Mode(m) => self.set_mode(m),
             Hit::Theme => {
@@ -914,6 +953,7 @@ impl App {
         self.root = Some(path);
         self.current = None;
         self.recent.clear();
+        self.history.clear();
         self.headings.clear();
         self.outline.set(&[]);
         unsafe { ffi::pv_clear(self.preview) };
@@ -967,6 +1007,7 @@ impl App {
 
     pub fn set_files(&mut self, files: Vec<String>) {
         self.tree.set_files(&files);
+        self.history.retain(|p| files.iter().any(|f| f == p));
         if let Some(c) = self.current.clone() {
             self.tree.set_active(&c);
         }
@@ -975,6 +1016,11 @@ impl App {
     // ---------------------------------------------------------------- documents
 
     pub fn open_file(&mut self, path: &str, line: Option<usize>) {
+        self.open_doc(path, line, true);
+    }
+
+    /// `record`: leaving the current document adds a back entry (false while going back / forward).
+    fn open_doc(&mut self, path: &str, line: Option<usize>, record: bool) {
         if self.current.as_deref() != Some(path) {
             self.flush_save();
             let text = match self.core.read(path) {
@@ -984,6 +1030,11 @@ impl App {
                     return;
                 }
             };
+            if record {
+                if let Some(v) = self.visit() {
+                    self.history.push(v);
+                }
+            }
             self.current = Some(path.to_string());
             self.disk = text.clone();
             self.dirty = false;
@@ -1008,6 +1059,153 @@ impl App {
         if let Some(l) = line {
             self.reveal_line(l, false);
         }
+    }
+
+    /// Where the reader is in the current document, for the back / forward stacks.
+    fn visit(&mut self) -> Option<Visit> {
+        let path = self.current.clone()?;
+        let top = self.view_top_line();
+        let section = self.headings.iter().rposition(|h| h.line as f64 <= top + 0.5).map(|i| self.headings[i].text.clone());
+        Some(Visit {
+            section,
+            path,
+            anchor: self.editor.msg(sci::SCI_GETANCHOR, 0, 0).max(0) as usize,
+            caret: self.editor.msg(sci::SCI_GETCURRENTPOS, 0, 0).max(0) as usize,
+            first_line: self.editor.msg(sci::SCI_GETFIRSTVISIBLELINE, 0, 0).max(0) as usize,
+            preview_y: unsafe { ffi::pv_scroll_y(self.preview) },
+        })
+    }
+
+    /// Back (or forward) `steps` documents, restoring selection and scroll there.
+    pub fn navigate(&mut self, back: bool, steps: usize) {
+        let Some(here) = self.visit() else { return };
+        let Some(to) = self.history.go(back, steps, here) else { return };
+        self.open_doc(&to.path, None, false);
+        if self.current.as_deref() != Some(to.path.as_str()) {
+            // Could not open it (deleted under us): forget it and stay put.
+            let core = &self.core;
+            self.history.retain(|p| core.has_file(p));
+            self.invalidate();
+            return;
+        }
+        let len = self.editor.msg(sci::SCI_GETLENGTH, 0, 0).max(0) as usize;
+        self.editor.msg(sci::SCI_SETSEL, to.anchor.min(len), to.caret.min(len) as isize);
+        self.editor.msg(sci::SCI_SETFIRSTVISIBLELINE, to.first_line, 0);
+        if self.effective_mode() == Mode::Preview {
+            unsafe { ffi::pv_set_scroll_y(self.preview, to.preview_y) };
+        }
+        self.track_top();
+        self.invalidate();
+    }
+
+    /// Right-click on an arrow: the stack behind it as a menu, nearest first, like a browser.
+    fn history_menu(&mut self, back: bool, at: POINT) {
+        // File name first (what people scan for), then the section they were reading, so two
+        // visits to one file read as two places; a place already listed is not listed again.
+        let entries: Vec<(usize, MenuRow)> = self
+            .history
+            .menu(back)
+            .into_iter()
+            .take(20)
+            .map(|(steps, v)| (steps, MenuRow { name: basename(&v.path).to_string(), section: v.section.clone(), dir: dirname(&v.path).to_string() }))
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        unsafe {
+            let m = CreatePopupMenu();
+            // Our own background, so the rows and the menu's edges are one surface.
+            let brush = CreateSolidBrush(theme::cref(self.pal.input_bg));
+            let mut mi: MENUINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MENUINFO>() as u32;
+            mi.fMask = MIM_BACKGROUND;
+            mi.hbrBack = brush;
+            SetMenuInfo(m, &mi);
+            self.menu_rows.clear();
+            for (i, (steps, row)) in entries.into_iter().enumerate() {
+                self.menu_rows.push(row);
+                AppendMenuW(m, MF_OWNERDRAW, steps, i as *const u16);
+            }
+            let mut pt = at;
+            ClientToScreen(self.hwnd, &mut pt);
+            let cmd = TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, self.hwnd, std::ptr::null()) as usize;
+            DestroyMenu(m);
+            DeleteObject(brush as _);
+            self.menu_rows.clear();
+            if cmd >= 1 {
+                self.navigate(back, cmd);
+            }
+        }
+    }
+
+    /// Width and height of a history-menu row: bold file name, " › section", folder dimmed
+    /// on the right, 10px either side.
+    fn measure_menu_row(&self, mi: &mut MEASUREITEMSTRUCT) {
+        let Some(row) = self.menu_rows.get(mi.itemData) else { return };
+        unsafe {
+            let dc = GetDC(self.hwnd);
+            let p = Painter { dc };
+            let mut w = self.px(10.0) + p.text_width(&row.name, self.fonts.ui_bold);
+            if let Some(s) = &row.section {
+                w += p.text_width(&format!("  \u{203A}  {s}"), self.fonts.ui);
+            }
+            if !row.dir.is_empty() {
+                w += self.px(24.0) + p.text_width(&row.dir, self.fonts.small);
+            }
+            w += self.px(10.0);
+            ReleaseDC(self.hwnd, dc);
+            mi.itemWidth = w.clamp(self.px(120.0), self.px(560.0)) as u32;
+            mi.itemHeight = self.px(28.0) as u32;
+        }
+    }
+
+    fn draw_menu_row(&self, di: &DRAWITEMSTRUCT) {
+        let Some(row) = self.menu_rows.get(di.itemData) else { return };
+        let pal = self.pal;
+        let p = Painter { dc: di.hDC };
+        let r = di.rcItem;
+        p.fill(&r, pal.input_bg);
+        if di.itemState & ODS_SELECTED != 0 {
+            let inset = self.px(3.0);
+            p.round_fill(&rect(r.left + inset, r.top + 1, r.right - inset, r.bottom - 1), pal.active, self.px(6.0));
+        }
+        let pad = self.px(10.0);
+        let right = r.right - pad;
+        let dir_w = if row.dir.is_empty() { 0 } else { p.text_width(&row.dir, self.fonts.small) };
+        let text_right = if dir_w > 0 { right - dir_w - self.px(24.0) } else { right };
+        let mut x = r.left + pad;
+        let nw = p.text_width(&row.name, self.fonts.ui_bold).min(text_right - x);
+        p.text(&row.name, &rect(x, r.top, x + nw, r.bottom), pal.fg, self.fonts.ui_bold, LEFT_MID);
+        x += nw;
+        if let Some(s) = &row.section {
+            p.text(&format!("  \u{203A}  {s}"), &rect(x, r.top, text_right, r.bottom), pal.fg, self.fonts.ui, LEFT_MID);
+        }
+        if dir_w > 0 {
+            p.text(&row.dir, &rect(right - dir_w, r.top, right, r.bottom), pal.fg_dim, self.fonts.small, LEFT_MID);
+        }
+    }
+
+    /// Tooltips over the painted arrows name where they lead.
+    fn place_tips(&self, back: &RECT, fwd: &RECT) {
+        for (id, r) in [(1usize, back), (2, fwd)] {
+            let mut ti: TTTOOLINFOW = unsafe { std::mem::zeroed() };
+            ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+            ti.hwnd = self.hwnd;
+            ti.uId = id;
+            ti.rect = *r;
+            send(self.tip, TTM_NEWTOOLRECTW, 0, &ti as *const _ as isize);
+        }
+    }
+
+    fn tip_text(&mut self, id: usize) -> *mut u16 {
+        let back = id == 1;
+        let (verb, keys) = if back { ("Back", "Alt+\u{2190}") } else { ("Forward", "Alt+\u{2192}") };
+        let s = match self.history.list(back).next() {
+            Some(v) => format!("{verb} to {}  ({keys})", place(v)),
+            None => format!("{verb}  ({keys})"),
+        };
+        self.tip_text = wide(&s);
+        self.tip_text.as_mut_ptr()
     }
 
     /// Jump to a source line in whichever pane is showing.
@@ -1137,7 +1335,8 @@ impl App {
             return;
         }
         let tb = self.lay.toolbar;
-        let x = tb.left + self.px(46.0);
+        // Same left edge as the painted title (after the sidebar toggle and back / forward).
+        let x = tb.left + self.px(108.0);
         let r = rect(x, tb.top + self.px(9.0), (x + self.px(420.0)).min(tb.right - self.px(260.0)), tb.bottom - self.px(9.0));
         move_window(self.rename_edit, &r);
         set_text(self.rename_edit, &from);
@@ -1187,6 +1386,7 @@ impl App {
                     *p = to.clone();
                 }
             }
+            self.history.rename(from, &to);
             if let Some(r) = self.root.as_ref().and_then(|r| r.to_str()).map(String::from) {
                 self.settings.set(&format!("last:{r}"), &to);
             }
@@ -1283,13 +1483,18 @@ impl App {
 
     /// Highlight the outline entry for the section at the top of the visible pane.
     pub fn track_top(&mut self) {
-        let line = if self.effective_mode() == Mode::Preview {
+        let line = self.view_top_line();
+        self.outline.set_top_line(line, &self.headings);
+    }
+
+    /// Source line at the top of the visible pane.
+    fn view_top_line(&mut self) -> f64 {
+        if self.effective_mode() == Mode::Preview {
             let y = unsafe { ffi::pv_scroll_y(self.preview) } as f64;
             interpolate(self.get_anchors(), y, false)
         } else {
             self.editor.top_line()
-        };
-        self.outline.set_top_line(line, &self.headings);
+        }
     }
 
     fn open_mermaid(&mut self, code: &str) {
@@ -1378,12 +1583,37 @@ impl App {
 
     /// App-wide shortcuts, checked before the focused control sees the key.
     pub fn pre_translate(&mut self, msg: &MSG) -> bool {
+        // Mouse side buttons, over any of our windows (they go to the child under the cursor).
+        if msg.message == WM_XBUTTONDOWN || msg.message == WM_XBUTTONUP {
+            if msg.message == WM_XBUTTONUP && !self.palette.open && !self.help.open {
+                let b = (msg.wParam >> 16) as u16;
+                self.navigate(b == XBUTTON1 as u16, 1);
+            }
+            return true;
+        }
+        // Releasing Ctrl after Ctrl+Tab opens the highlighted file.
+        if msg.message == WM_KEYUP && msg.wParam as u16 == VK_CONTROL && self.palette.is_switcher() {
+            self.palette_pick();
+            return true;
+        }
+        if (msg.message == WM_SYSKEYUP || msg.message == WM_KEYUP) && msg.wParam as u16 == VK_MENU && std::mem::take(&mut self.alt_nav) {
+            return true;
+        }
         if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
             return false;
         }
         let key = msg.wParam as u16;
         let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(vk as i32) } < 0;
         let (ctrl, shift, alt) = (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU));
+        if alt && !ctrl && !shift && (key == VK_LEFT || key == VK_RIGHT) && !self.palette.open && !is_visible(self.rename_edit) {
+            if self.help.open {
+                self.help.close();
+                self.restore_focus();
+            }
+            self.alt_nav = true;
+            self.navigate(key == VK_LEFT, 1);
+            return true;
+        }
         if key == VK_F1 {
             self.toggle_help();
             return true;
@@ -1409,6 +1639,13 @@ impl App {
             (0x50 /* P */ | 0x4F /* O */, false, false) => {
                 if self.has_ws() {
                     self.open_file_palette();
+                }
+            }
+            (VK_TAB, _, false) => {
+                if self.palette.is_switcher() {
+                    self.palette_step(if shift { -1 } else { 1 });
+                } else if !self.palette.open && self.has_ws() {
+                    self.open_switcher(shift);
                 }
             }
             (0x52 /* R */, false, false) => {
@@ -1565,6 +1802,11 @@ impl App {
 
     fn on_notify(&mut self, nm: *const NMHDR) -> Option<LRESULT> {
         let hdr = unsafe { &*nm };
+        if hdr.hwndFrom == self.tip && hdr.code == TTN_GETDISPINFOW {
+            let di = unsafe { &mut *(nm as *mut NMTTDISPINFOW) };
+            di.lpszText = self.tip_text(hdr.idFrom);
+            return Some(0);
+        }
         if hdr.hwndFrom == self.editor.hwnd {
             let n = unsafe { &*(nm as *const sci::SCNotification) };
             match n.code {
@@ -1690,6 +1932,42 @@ impl App {
                     self.on_click(h, x, y);
                 }
                 Some(0)
+            }
+            WM_MEASUREITEM => {
+                let mi = unsafe { &mut *(lp as *mut MEASUREITEMSTRUCT) };
+                if mi.CtlType != ODT_MENU {
+                    return None;
+                }
+                self.measure_menu_row(mi);
+                Some(1)
+            }
+            WM_DRAWITEM => {
+                let di = unsafe { &*(lp as *const DRAWITEMSTRUCT) };
+                if di.CtlType != ODT_MENU {
+                    return None;
+                }
+                self.draw_menu_row(di);
+                Some(1)
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+                match self.hit_at(x, y) {
+                    Some(h @ (Hit::Back | Hit::Forward)) => {
+                        self.history_menu(h == Hit::Back, POINT { x, y });
+                        Some(0)
+                    }
+                    _ => None,
+                }
+            }
+            WM_APPCOMMAND => {
+                // Browser back / forward keys on keyboards and mice (when not already caught as
+                // XBUTTON in the message loop).
+                match (lp >> 16) as u32 & 0x0fff {
+                    1 /* APPCOMMAND_BROWSER_BACKWARD */ => self.navigate(true, 1),
+                    2 /* APPCOMMAND_BROWSER_FORWARD */ => self.navigate(false, 1),
+                    _ => return None,
+                }
+                Some(1)
             }
             WM_LBUTTONUP => {
                 if self.drag_side.take().is_some() {
@@ -1873,6 +2151,37 @@ fn register_toast(inst: HINSTANCE) {
         hIconSm: std::ptr::null_mut(),
     };
     unsafe { RegisterClassExW(&wc) };
+}
+
+/// One tooltip control for the painted toolbar arrows; text comes from TTN_GETDISPINFO.
+fn create_tip(owner: HWND) -> HWND {
+    let cls = wide("tooltips_class32");
+    unsafe {
+        let tip = CreateWindowExW(
+            WS_EX_TOPMOST,
+            cls.as_ptr(),
+            std::ptr::null(),
+            WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            owner,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        );
+        for id in [1usize, 2] {
+            let mut ti: TTTOOLINFOW = std::mem::zeroed();
+            ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+            ti.uFlags = TTF_SUBCLASS;
+            ti.hwnd = owner;
+            ti.uId = id;
+            ti.lpszText = -1isize as *mut u16; // LPSTR_TEXTCALLBACKW
+            send(tip, TTM_ADDTOOLW, 0, &ti as *const _ as isize);
+        }
+        tip
+    }
 }
 
 fn create_toast(owner: HWND) -> HWND {

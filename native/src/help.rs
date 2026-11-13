@@ -15,7 +15,7 @@ use crate::win::*;
 /// alternatives; a leading "~" marks a mouse gesture, drawn as plain text instead of caps.
 const SECTIONS: &[(&str, usize, &[(&str, &str)])] = &[
     ("Files & folders", 0, &[("Open folder", "Ctrl+Shift+O"), ("New file", "Ctrl+N"), ("Rename / move file", "F2"), ("Save (autosave is on)", "Ctrl+S")]),
-    ("Navigate", 0, &[("Go to file", "Ctrl+P / Ctrl+O"), ("Go to heading", "Ctrl+R"), ("Search in all files", "Ctrl+Shift+F"), ("Show file list", "Ctrl+Shift+E")]),
+    ("Navigate", 0, &[("Go to file", "Ctrl+P / Ctrl+O"), ("Back / forward", "Alt+← / →"), ("Switch to recent file", "Ctrl+Tab"), ("Go to heading", "Ctrl+R"), ("Search in all files", "Ctrl+Shift+F"), ("Show file list", "Ctrl+Shift+E")]),
     ("View", 0, &[("Code / Split / Preview", "Ctrl+1 / 2 / 3"), ("Show / hide sidebar", "Ctrl+B"), ("Switch light / dark", "Ctrl+Shift+L"), ("This help", "F1")]),
     ("Preview", 0, &[("Select text by word, then Ctrl+C", "~Drag"), ("Copy code / link / paragraph", "~Right-click"), ("Open image", "~Double-click"), ("View diagram in browser", "~Double-click")]),
     (
