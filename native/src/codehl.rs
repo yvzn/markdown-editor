@@ -31,6 +31,7 @@ impl CodeColours {
         let mut seen: HashMap<u64, Runs> = HashMap::new();
         ed.clear_code_colours();
         for (start, end, info) in fenced_blocks(&text) {
+            ed.mark_code_block(start, end);
             if end - start > MAX_BLOCK {
                 continue;
             }

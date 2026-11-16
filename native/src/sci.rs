@@ -83,6 +83,17 @@ const SCI_INDICSETFLAGS: u32 = 2684;
 const SC_INDICFLAG_VALUEFORE: isize = 1;
 const SC_INDICVALUEBIT: usize = 0x0100_0000;
 const INDIC_PLAIN: isize = 0;
+/// Marker giving fenced code lines the preview's code background.
+const MARK_CODE: usize = 20;
+const SC_MARK_BACKGROUND: isize = 22;
+const SCI_MARKERDEFINE: u32 = 2040;
+const SCI_MARKERSETBACK: u32 = 2042;
+const SCI_MARKERADD: u32 = 2043;
+const SCI_MARKERDELETEALL: u32 = 2045;
+const SCI_SETCARETLINELAYER: u32 = 2765;
+const SC_LAYER_UNDER_TEXT: usize = 1;
+const SCI_SETSELECTIONLAYER: u32 = 2763;
+const SC_LAYER_OVER_TEXT: usize = 2;
 
 /// Byte ranges of the http(s) URLs in `text`, without trailing punctuation.
 pub fn url_ranges(text: &str) -> Vec<(usize, usize)> {
@@ -339,12 +350,20 @@ impl Editor {
         self.msg(SCI_SETCARETFORE, cref(p.fg) as isize as usize, 0);
         // Element colours take 0xAABBGGRR.
         let opaque = |c: u32| (cref(c) | 0xff00_0000) as isize;
-        self.msg(SCI_SETELEMENTCOLOUR, 11, opaque(p.active)); // selection
-        self.msg(SCI_SETELEMENTCOLOUR, 13, opaque(p.active)); // additional selections
-        self.msg(SCI_SETELEMENTCOLOUR, 17, opaque(p.active)); // inactive selection
+        // Selection as in the preview: the accent at 45% drawn over the text, which keeps its colours.
+        let sel = (cref(p.accent) | 0x7300_0000) as isize;
+        self.msg(SCI_SETSELECTIONLAYER, SC_LAYER_OVER_TEXT, 0);
+        self.msg(SCI_SETELEMENTCOLOUR, 11, sel); // selection
+        self.msg(SCI_SETELEMENTCOLOUR, 13, sel); // additional selections
+        self.msg(SCI_SETELEMENTCOLOUR, 17, sel); // inactive selection
         self.msg(SCI_SETELEMENTCOLOUR, 40, opaque(p.fg)); // caret
-        let line = if p.dark { 0x2c313a } else { 0xf6f8fa };
-        self.msg(SCI_SETELEMENTCOLOUR, 50, opaque(line)); // caret line
+        // Caret line: a translucent accent tint drawn over the line's own background, so it
+        // stays distinct both on plain lines and on code block lines (which have code_bg).
+        let tint = if p.dark { 0x1c00_0000 } else { 0x1400_0000 };
+        self.msg(SCI_SETCARETLINELAYER, SC_LAYER_UNDER_TEXT, 0);
+        self.msg(SCI_SETELEMENTCOLOUR, 50, (cref(p.accent) | tint) as isize); // caret line
+        self.msg(SCI_MARKERDEFINE, MARK_CODE, SC_MARK_BACKGROUND);
+        self.msg(SCI_MARKERSETBACK, MARK_CODE, cref(p.code_bg) as isize);
 
         // SCE_MARKDOWN_* styles.
         let head = if p.dark { 0xe5c07b } else { 0x0550ae };
@@ -395,6 +414,18 @@ impl Editor {
     pub fn clear_code_colours(&self) {
         self.msg(SCI_SETINDICATORCURRENT, IND_CODE, 0);
         self.msg(SCI_INDICATORCLEARRANGE, 0, self.msg(SCI_GETLENGTH, 0, 0));
+        self.msg(SCI_MARKERDELETEALL, MARK_CODE, 0);
+    }
+
+    /// Give a fenced block's lines, fences included, the code background. `start..end` is the
+    /// content range from `codehl::fenced_blocks`.
+    pub fn mark_code_block(&self, start: usize, end: usize) {
+        // start - 1 is the opening fence's newline; end is the closing fence's line start.
+        let first = self.msg(SCI_LINEFROMPOSITION, start.saturating_sub(1), 0) as usize;
+        let last = self.msg(SCI_LINEFROMPOSITION, end, 0) as usize;
+        for l in first..=last {
+            self.msg(SCI_MARKERADD, l, MARK_CODE as isize);
+        }
     }
 
     /// Colour runs (offset from `base`, length, 0xBBGGRR) of a fenced code block.
