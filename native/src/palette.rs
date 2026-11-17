@@ -6,6 +6,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::app::{app, basename, make_edit, App, Fonts, Mode, ID_PALETTE_EDIT, WM_CHECK_FOCUS};
@@ -127,6 +128,7 @@ impl PaletteUi {
                 inst,
                 std::ptr::null(),
             );
+            SetWindowSubclass(list, Some(list_subclass), 1, 0);
             let scrim = crate::scrim::create(parent, || {
                 let a = app();
                 a.palette.close();
@@ -341,16 +343,32 @@ unsafe extern "system" fn palette_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 a.palette_update();
             } else if id == ID_PALETTE_EDIT && code == EN_KILLFOCUS {
                 PostMessageW(a.hwnd, WM_CHECK_FOCUS, 0, 0);
-            } else if id == ID_LIST && code == LBN_SELCHANGE as u32 {
-                let i = send(a.palette.list, LB_GETCURSEL, 0, 0);
-                if i >= 0 && GetKeyState(VK_LBUTTON as i32) < 0 {
-                    a.palette.sel = i as usize;
-                    a.palette_choose();
-                }
             }
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Mouse in the result list: a click opens the row under the cursor. Handled here, not via
+/// LBN_SELCHANGE, which fires on button up and never for the already-selected row; the
+/// click is also swallowed so focus stays in the edit box.
+unsafe extern "system" fn list_subclass(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    if !crate::app::app_ready() {
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+    match msg {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let r = send(h, LB_ITEMFROMPOINT, 0, lp as u32 as isize);
+            let (i, outside) = ((r & 0xffff) as usize, (r >> 16) & 0xffff != 0);
+            let a = app();
+            if !outside && i < a.palette.items.len() {
+                a.palette.sel = i;
+                a.palette_choose();
+            }
+            0
+        }
+        _ => DefSubclassProc(h, msg, wp, lp),
     }
 }
 
