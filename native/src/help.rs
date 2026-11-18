@@ -16,7 +16,7 @@ use crate::win::*;
 const SECTIONS: &[(&str, usize, &[(&str, &str)])] = &[
     ("Files & folders", 0, &[("Open folder", "Ctrl+Shift+O"), ("New file", "Ctrl+N"), ("Rename / move file", "F2"), ("Save (autosave is on)", "Ctrl+S")]),
     ("Navigate", 0, &[("Go to file", "Ctrl+P / Ctrl+O"), ("Back / forward", "Alt+← / →"), ("Switch to recent file", "Ctrl+Tab"), ("Go to heading", "Ctrl+R"), ("Search in all files", "Ctrl+Shift+F"), ("Show file list", "Ctrl+Shift+E")]),
-    ("View", 0, &[("Code / Split / Preview", "Ctrl+1 / 2 / 3"), ("Show / hide sidebar", "Ctrl+B"), ("Switch light / dark", "Ctrl+Shift+L"), ("This help", "F1")]),
+    ("View", 0, &[("Code / Split / Preview", "Ctrl+1 / 2 / 3"), ("Show / hide sidebar", "Ctrl+B"), ("Switch light / dark", "Ctrl+Shift+L"), ("Bigger / smaller text", "Ctrl++ / Ctrl+-"), ("Bigger / smaller text with the mouse", "Ctrl+Wheel"), ("Reset text size", "Ctrl+0"), ("This help", "F1")]),
     ("Preview", 0, &[("Select text by word, then Ctrl+C", "~Drag"), ("Copy code / link / paragraph", "~Right-click"), ("Open image", "~Double-click"), ("View diagram in browser", "~Double-click")]),
     (
         "Editor",

@@ -39,6 +39,13 @@ const T_SAVE: usize = 1;
 const T_PREVIEW: usize = 2;
 const T_OUTLINE: usize = 3;
 const T_TOAST: usize = 4;
+
+/// Zoom levels, as in browsers.
+const ZOOM_STEPS: [f32; 13] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+
+fn clamp_zoom(z: f32) -> f32 {
+    if z.is_finite() { z.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]) } else { 1.0 }
+}
 const T_LOCK: usize = 5;
 pub const T_SEARCH: usize = 6;
 const T_SNAPSHOT: usize = 7;
@@ -91,6 +98,7 @@ pub enum Hit {
     SearchRegex,
     WelcomeOpen,
     SideSplitter,
+    ZoomReset,
 }
 
 pub struct Fonts {
@@ -160,6 +168,10 @@ pub struct App {
     rename_edit: HWND,
     toast: HWND,
     toast_text: String,
+    /// Text zoom of the editor and the preview together (1.0 = 100%).
+    zoom: f32,
+    /// Ctrl+wheel deltas not yet worth a zoom step (precision touchpads send small ones).
+    zoom_wheel: i32,
 
     pub root: Option<PathBuf>,
     pub current: Option<String>,
@@ -414,7 +426,9 @@ impl App {
                 std::ptr::null(),
             );
             let scale = dpi_scale(hwnd);
-            let editor = Editor::create(hwnd);
+            let mut editor = Editor::create(hwnd);
+            let zoom = settings.get("zoom").and_then(|v| v.parse::<f32>().ok()).map_or(1.0, clamp_zoom);
+            editor.zoom = zoom;
             let preview = ffi::pv_create(hwnd);
             SetWindowLongPtrW(preview, GWL_STYLE, GetWindowLongPtrW(preview, GWL_STYLE) | WS_CLIPSIBLINGS as isize);
             let a = Box::new(App {
@@ -437,6 +451,8 @@ impl App {
                 rename_edit: make_edit(hwnd, ID_RENAME_EDIT, ""),
                 toast: create_toast(hwnd),
                 toast_text: String::new(),
+                zoom,
+                zoom_wheel: 0,
                 root: None,
                 current: None,
                 disk: String::new(),
@@ -799,6 +815,14 @@ impl App {
             self.button(p, r, Hit::Mode(m), label, self.fonts.ui, md && m == mode, md, pal.bar);
             x -= w + self.px(2.0);
         }
+        // Zoom badge: only there when the text isn't at 100%; a click puts it back.
+        if self.zoom != 1.0 {
+            let label = format!("{}%", (self.zoom * 100.0).round());
+            let w = p.text_width(&label, self.fonts.ui) + self.px(20.0);
+            let r = rect(x - self.px(6.0) - w, ty, x - self.px(6.0), ty + ib);
+            self.button(p, r, Hit::ZoomReset, &label, self.fonts.ui, false, true, pal.bar);
+            x = r.left - self.px(2.0);
+        }
         let title_left = fwd_r.right + self.px(10.0);
         let title_right = x - self.px(12.0);
         if !crate::win::is_visible(self.rename_edit) {
@@ -893,6 +917,7 @@ impl App {
                 self.invalidate();
             }
             Hit::WelcomeOpen => self.pick_folder(),
+            Hit::ZoomReset => self.set_zoom(1.0),
             Hit::SideSplitter => {
                 self.drag_side = Some(x - self.lay.side.right);
                 let _ = y;
@@ -907,16 +932,56 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- zoom
+
+    /// One step bigger or smaller on the browser zoom ladder; nothing happens past either end.
+    fn zoom_step(&mut self, bigger: bool) {
+        let cur = self.zoom;
+        let next = if bigger {
+            ZOOM_STEPS.iter().copied().find(|&z| z > cur + 0.001)
+        } else {
+            ZOOM_STEPS.iter().rev().copied().find(|&z| z < cur - 0.001)
+        };
+        if let Some(z) = next {
+            self.set_zoom(z);
+        }
+    }
+
+    /// Zoom the editor and the preview together, keep the reading position, and remember it.
+    fn set_zoom(&mut self, zoom: f32) {
+        let zoom = clamp_zoom(zoom);
+        if (zoom - self.zoom).abs() < 0.001 {
+            return;
+        }
+        self.zoom = zoom;
+        self.settings.set("zoom", &format!("{zoom}"));
+        self.editor.set_zoom(zoom);
+        // The preview reflows: keep the same fraction of the document at the top.
+        let (y, h) = unsafe { (ffi::pv_scroll_y(self.preview), ffi::pv_content_height(self.preview)) };
+        self.refresh_preview(true);
+        if h > 0.0 {
+            let nh = unsafe { ffi::pv_content_height(self.preview) };
+            unsafe { ffi::pv_set_scroll_y(self.preview, y / h * nh) };
+        }
+        let msg = if zoom == 1.0 { "Zoom 100%".to_string() } else { format!("Zoom {}%  \u{00B7}  Ctrl+0 to reset", (zoom * 100.0).round()) };
+        self.toast_for(&msg, 1500);
+        self.invalidate();
+    }
+
     // ---------------------------------------------------------------- toast
 
     pub fn toast(&mut self, msg: &str) {
+        self.toast_for(msg, 4000);
+    }
+
+    fn toast_for(&mut self, msg: &str, ms: u32) {
         self.toast_text = msg.to_string();
         set_text(self.toast, msg);
         self.position_toast();
         unsafe {
             ShowWindow(self.toast, SW_SHOWNOACTIVATE);
             InvalidateRect(self.toast, std::ptr::null(), 1);
-            SetTimer(self.hwnd, T_TOAST, 4000, None);
+            SetTimer(self.hwnd, T_TOAST, ms, None);
         }
     }
 
@@ -1430,7 +1495,7 @@ impl App {
             body = markdown::mark_matches(&body, &m.re);
         }
         let html = markdown::page(&body);
-        let css = markdown::css(&self.pal);
+        let css = markdown::css(&self.pal, self.zoom);
         let base = root.join(dirname(&cur).replace('/', "\\"));
         let base_w = wide(&base.to_string_lossy());
         let html_c = CString::new(html.replace('\0', "")).unwrap();
@@ -1601,6 +1666,16 @@ impl App {
             }
             return true;
         }
+        // Ctrl+wheel zooms the text wherever the mouse is, as in browsers and VS Code.
+        if msg.message == WM_MOUSEWHEEL && (msg.wParam & 0x0008 /* MK_CONTROL */) != 0 && !self.help.open {
+            self.zoom_wheel += (msg.wParam >> 16) as u16 as i16 as i32;
+            while self.zoom_wheel.abs() >= WHEEL_DELTA as i32 {
+                let up = self.zoom_wheel > 0;
+                self.zoom_wheel -= if up { WHEEL_DELTA as i32 } else { -(WHEEL_DELTA as i32) };
+                self.zoom_step(up);
+            }
+            return true;
+        }
         // Releasing Ctrl after Ctrl+Tab opens the highlighted file.
         if msg.message == WM_KEYUP && msg.wParam as u16 == VK_CONTROL && self.palette.is_switcher() {
             self.palette_pick();
@@ -1645,6 +1720,23 @@ impl App {
             return false;
         }
         let in_editor = self.editor.has_focus();
+        // Zoom keys as in browsers. Matched by the character the key types, so Ctrl+- works on
+        // layouts where "-" isn't VK_OEM_MINUS (AZERTY has it on the 6 key).
+        if !alt {
+            let ch = char::from_u32(unsafe { MapVirtualKeyW(key as u32, MAPVK_VK_TO_CHAR) } & 0x7fff).unwrap_or('\0');
+            if key == VK_ADD || ch == '=' || ch == '+' {
+                self.zoom_step(true);
+                return true;
+            }
+            if key == VK_SUBTRACT || ch == '-' {
+                self.zoom_step(false);
+                return true;
+            }
+            if !shift && (key == VK_0 || key == VK_NUMPAD0) {
+                self.set_zoom(1.0);
+                return true;
+            }
+        }
         match (key, shift, alt) {
             (0x50 /* P */ | 0x4F /* O */, false, false) => {
                 if self.has_ws() {

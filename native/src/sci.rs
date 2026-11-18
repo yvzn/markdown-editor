@@ -187,6 +187,9 @@ const SCMOD_CTRL: usize = 2;
 const SCMOD_ALT: usize = 4;
 const SCK_DOWN: usize = 300;
 const SCK_UP: usize = 301;
+const SCK_ADD: usize = 310;
+const SCK_SUBTRACT: usize = 311;
+const SCK_DIVIDE: usize = 312;
 
 #[repr(C)]
 pub struct SCNotification {
@@ -242,7 +245,12 @@ unsafe extern "system" fn editor_subclass(h: HWND, msg: u32, wp: usize, lp: isiz
 
 pub struct Editor {
     pub hwnd: HWND,
+    /// Text zoom shared with the preview (1.0 = 100%); scales every style's font size.
+    pub zoom: f32,
 }
+
+/// Editor text size at 100% zoom, in points.
+const BASE_SIZE: f32 = 10.5;
 
 impl Editor {
     pub fn create(parent: HWND) -> Editor {
@@ -251,7 +259,7 @@ impl Editor {
             ffi::Scintilla_RegisterClasses(inst as _);
             let cls = wide("Scintilla");
             let hwnd = CreateWindowExW(0, cls.as_ptr(), std::ptr::null(), WS_CHILD | WS_TABSTOP | WS_CLIPSIBLINGS, 0, 0, 100, 100, parent, std::ptr::null_mut(), inst, std::ptr::null());
-            let e = Editor { hwnd };
+            let e = Editor { hwnd, zoom: 1.0 };
             e.setup();
             windows_sys::Win32::UI::Shell::SetWindowSubclass(hwnd, Some(editor_subclass), 1, 0);
             e
@@ -319,6 +327,24 @@ impl Editor {
         self.msg(SCI_CLEARCMDKEY, key('D' as usize, SCMOD_CTRL), 0);
         // Ctrl+C with nothing selected copies the current line; pasting it inserts a whole line.
         self.msg(SCI_ASSIGNCMDKEY, key('C' as usize, SCMOD_CTRL), SCI_COPYALLOWLINE as isize);
+        // Zoom is app-wide (editor and preview together), so drop Scintilla's own
+        // Ctrl+numpad +/- and / keys; Ctrl+wheel is caught by the app before it gets here.
+        for k in [SCK_ADD, SCK_SUBTRACT, SCK_DIVIDE] {
+            self.msg(SCI_CLEARCMDKEY, key(k, SCMOD_CTRL), 0);
+        }
+    }
+
+    /// Scale the text to `zoom` (1.0 = 100%), keeping the same line at the top of the view.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let top = self.top_line();
+        self.zoom = zoom;
+        let size = (BASE_SIZE * zoom * 100.0).round() as isize;
+        // Every style the lexer uses, the default and the line numbers (STYLECLEARALL copies the default).
+        for s in 0..=STYLE_LINENUMBER {
+            self.msg(SCI_STYLESETSIZEFRACTIONAL, s, size);
+        }
+        self.update_margin();
+        self.scroll_to_line(top);
     }
 
     fn set_font(&self, style: usize, family: &str, size: f32) {
@@ -340,7 +366,7 @@ impl Editor {
     pub fn apply_theme(&self, p: &Palette) {
         use crate::theme::cref;
         let mono = if crate::font_exists("Cascadia Mono") { "Cascadia Mono" } else { "Consolas" };
-        self.set_font(STYLE_DEFAULT, mono, 10.5);
+        self.set_font(STYLE_DEFAULT, mono, BASE_SIZE * self.zoom);
         self.msg(SCI_STYLESETFORE, STYLE_DEFAULT, cref(p.fg) as isize);
         self.msg(SCI_STYLESETBACK, STYLE_DEFAULT, cref(p.bg) as isize);
         self.msg(SCI_STYLECLEARALL, 0, 0);

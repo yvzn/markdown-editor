@@ -202,17 +202,19 @@ pub fn mark_matches(html: &str, re: &regex::Regex) -> String {
 }
 
 /// Stylesheet for the preview, after the webview build's `.markdown-body` rules.
-pub fn css(p: &Palette) -> String {
+/// `zoom` (1.0 = 100%) scales the pixel sizes, so text reflows instead of being stretched.
+pub fn css(p: &Palette, zoom: f32) -> String {
     let c = |v: u32| format!("#{v:06x}");
+    let z = |v: f32| format!("{}px", (v * zoom).round());
     format!(
         r#"
 html, body {{ background: {bg}; color: {fg}; }}
-body {{ margin: 0; padding: 24px 24px 0; font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif; font-size: 15px; line-height: 1.6; }}
+body {{ margin: 0; padding: {pad} {pad} 0; font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif; font-size: {body}; line-height: 1.6; }}
 /* Reading measure: 31.5em of 15px (~68 chars a line, max ~75) for prose, centered. Code, tables
    and figures may grow to the full width and stay centered; code starts at the same ~75 chars.
    No calc() in litehtml: pre pads in ch so the width is measure + 2 * 2ch padding. */
 .page {{ --code-measure: {code_measure}ch; }}
-.page > * {{ max-width: 472px; margin-left: auto; margin-right: auto; }}
+.page > * {{ max-width: {measure}; margin-left: auto; margin-right: auto; }}
 .page > pre {{ display: table; box-sizing: border-box; width: var(--code-measure); max-width: 100%; }}
 .page > pre.wide {{ width: auto; }}
 .page > table {{ max-width: 100%; }}
@@ -230,14 +232,14 @@ a {{ color: {accent}; text-decoration: none; cursor: pointer; }}
 a:hover {{ text-decoration: underline; }}
 strong {{ font-weight: 600; }}
 code {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.88em; background: {code_bg}; padding: 0.15em 0.35em; border-radius: 4px; }}
-pre {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; background: {code_bg}; padding: 12px 2ch; border-radius: 6px; line-height: 1.45; white-space: pre-wrap; }}
-pre code {{ background: transparent; padding: 0; font-size: 13px; }}
+pre {{ font-family: "Cascadia Mono", Consolas, monospace; font-size: {code}; background: {code_bg}; padding: {code_pad} 2ch; border-radius: 6px; line-height: 1.45; white-space: pre-wrap; }}
+pre code {{ background: transparent; padding: 0; font-size: {code}; }}
 blockquote {{ margin-left: 0; margin-right: 0; padding: 0 1em; color: {dim}; border-left: 4px solid {border_strong}; }}
 ul, ol {{ padding-left: 2em; }}
 li + li {{ margin-top: 0.25em; }}
 li > p {{ margin-bottom: 0.5em; }}
-table {{ border-collapse: collapse; }}
-th, td {{ border: 1px solid {border_strong}; padding: 5px 12px; }}
+table {{ border-collapse: collapse; font-size: 1em; }}
+th, td {{ border: 1px solid {border_strong}; padding: {cell_v} {cell_h}; }}
 th {{ font-weight: 600; white-space: nowrap; }}
 tr:nth-child(2n) {{ background: {side}; }}
 img {{ max-width: 100%; }}
@@ -260,6 +262,13 @@ sup {{ font-size: 0.75em; vertical-align: super; line-height: 0; }}
         side = c(p.side),
         mark = c(p.mark),
         code_measure = MEASURE_CHARS + 4,
+        pad = z(24.0),
+        body = z(15.0),
+        measure = z(472.0),
+        code = z(13.0),
+        code_pad = z(12.0),
+        cell_v = z(5.0),
+        cell_h = z(12.0),
     )
 }
 
