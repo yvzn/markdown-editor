@@ -78,6 +78,27 @@ const IND_URL: usize = 9;
 /// Indicator colouring fenced code (INDIC_TEXTFORE; each run's value carries its colour).
 const IND_CODE: usize = 10;
 const INDIC_TEXTFORE: isize = 17;
+/// Indicator squiggling misspelled words.
+const IND_SPELL: usize = 11;
+const INDIC_SQUIGGLEPIXMAP: isize = 13;
+const SCI_INDICATORSTART: u32 = 2508;
+const SCI_INDICATOREND: u32 = 2509;
+const SCI_POINTXFROMPOSITION: u32 = 2164;
+const SCI_POINTYFROMPOSITION: u32 = 2165;
+const SCI_TEXTHEIGHT: u32 = 2279;
+pub const SCI_CANREDO: u32 = 2016;
+pub const SCI_CANPASTE: u32 = 2173;
+pub const SCI_CANUNDO: u32 = 2174;
+pub const SCI_UNDO: u32 = 2176;
+pub const SCI_CUT: u32 = 2177;
+pub const SCI_COPY: u32 = 2178;
+pub const SCI_CLEAR: u32 = 2180;
+pub const SCI_REDO: u32 = 2011;
+pub const SCI_SELECTALL: u32 = 2013;
+pub const SC_UPDATE_SELECTION: i32 = 0x2;
+/// Sent to the editor's parent instead of Scintilla's own context menu.
+/// wParam: the editor, lParam: screen point as in WM_CONTEXTMENU (-1 from the keyboard).
+pub const WM_EDITOR_MENU: u32 = WM_APP + 20;
 const SCI_SETINDICATORVALUE: u32 = 2502;
 const SCI_INDICSETFLAGS: u32 = 2684;
 const SC_INDICFLAG_VALUEFORE: isize = 1;
@@ -232,6 +253,9 @@ unsafe extern "system" fn editor_subclass(h: HWND, msg: u32, wp: usize, lp: isiz
         let pos = send(h, SCI_POSITIONFROMPOINTCLOSE, pt.x as usize, pt.y as isize);
         pos >= 0 && send(h, SCI_INDICATORVALUEAT, IND_URL, pos) != 0
     };
+    if msg == WM_CONTEXTMENU {
+        return SendMessageW(GetParent(h), WM_EDITOR_MENU, h as usize, lp);
+    }
     if msg == WM_SETCURSOR && (lp & 0xffff) as u32 == HTCLIENT && over_url(h) {
         SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
         return 1;
@@ -423,6 +447,8 @@ impl Editor {
         self.msg(SCI_INDICSETFORE, IND_URL, cref(p.accent) as isize);
         self.msg(SCI_INDICSETSTYLE, IND_CODE, INDIC_TEXTFORE);
         self.msg(SCI_INDICSETFLAGS, IND_CODE, SC_INDICFLAG_VALUEFORE);
+        self.msg(SCI_INDICSETSTYLE, IND_SPELL, INDIC_SQUIGGLEPIXMAP);
+        self.msg(SCI_INDICSETFORE, IND_SPELL, cref(if p.dark { 0xf85149 } else { 0xd1242f }) as isize);
         self.msg(SCI_COLOURISE, 0, -1);
         self.mark_urls();
         self.update_margin();
@@ -461,6 +487,82 @@ impl Editor {
             self.msg(SCI_SETINDICATORVALUE, bgr as usize | SC_INDICVALUEBIT, 0);
             self.msg(SCI_INDICATORFILLRANGE, base + off as usize, len as isize);
         }
+    }
+
+    /// Byte range of the document lines on screen, widened by `margin` lines each way.
+    pub fn visible_range(&self, margin: usize) -> (usize, usize) {
+        let vis = self.msg(SCI_GETFIRSTVISIBLELINE, 0, 0) as usize;
+        let rows = self.msg(SCI_LINESONSCREEN, 0, 0) as usize;
+        let first = (self.msg(SCI_DOCLINEFROMVISIBLE, vis, 0) as usize).saturating_sub(margin);
+        let last = self.msg(SCI_DOCLINEFROMVISIBLE, vis + rows + 1, 0) as usize + margin;
+        let len = self.msg(SCI_GETLENGTH, 0, 0) as usize;
+        let lo = self.msg(SCI_POSITIONFROMLINE, first, 0).max(0) as usize;
+        let hi = if last + 1 >= self.line_count() { len } else { self.msg(SCI_POSITIONFROMLINE, last + 1, 0).max(0) as usize };
+        (lo.min(len), hi.min(len))
+    }
+
+    pub fn clear_spelling(&self, lo: usize, hi: usize) {
+        self.msg(SCI_SETINDICATORCURRENT, IND_SPELL, 0);
+        self.msg(SCI_INDICATORCLEARRANGE, lo, hi.saturating_sub(lo) as isize);
+    }
+
+    pub fn mark_misspelled(&self, s: usize, e: usize) {
+        self.msg(SCI_SETINDICATORCURRENT, IND_SPELL, 0);
+        self.msg(SCI_INDICATORFILLRANGE, s, (e - s) as isize);
+    }
+
+    /// The misspelled word under byte position `pos`: its range and text.
+    pub fn misspelled_at(&self, pos: usize) -> Option<(usize, usize, String)> {
+        if self.msg(SCI_INDICATORVALUEAT, IND_SPELL, pos as isize) == 0 {
+            return None;
+        }
+        let s = self.msg(SCI_INDICATORSTART, IND_SPELL, pos as isize).max(0) as usize;
+        let e = self.msg(SCI_INDICATOREND, IND_SPELL, pos as isize).max(0) as usize;
+        let text = self.text();
+        text.get(s..e).filter(|w| !w.is_empty()).map(|w| (s, e, w.to_string()))
+    }
+
+    /// Replace `s..e` with `with`, as one undo step, leaving the caret after it.
+    pub fn replace_range(&self, s: usize, e: usize, with: &str) {
+        self.msg(SCI_SETTARGETRANGE, s, e as isize);
+        self.msg(SCI_REPLACETARGET, with.len(), with.as_ptr() as isize);
+        let end = s + with.len();
+        self.msg(SCI_SETSEL, end, end as isize);
+    }
+
+    /// Replace every range (sorted, non-overlapping) with `with`, as one undo step. Done from
+    /// the last one back so earlier offsets stay valid; the caret moves with the text.
+    pub fn replace_ranges(&self, ranges: &[(usize, usize)], with: &str) {
+        self.msg(SCI_BEGINUNDOACTION, 0, 0);
+        for &(s, e) in ranges.iter().rev() {
+            self.msg(SCI_SETTARGETRANGE, s, e as isize);
+            self.msg(SCI_REPLACETARGET, with.len(), with.as_ptr() as isize);
+        }
+        self.msg(SCI_ENDUNDOACTION, 0, 0);
+    }
+
+    /// Document position at a client point (nearest character), or the caret when `None`.
+    pub fn pos_at(&self, client: Option<(i32, i32)>) -> usize {
+        match client {
+            Some((x, y)) => {
+                let p = self.msg(SCI_POSITIONFROMPOINTCLOSE, x as usize, y as isize);
+                if p >= 0 { p as usize } else { self.caret() }
+            }
+            None => self.caret(),
+        }
+    }
+
+    pub fn caret(&self) -> usize {
+        self.msg(SCI_GETCURRENTPOS, 0, 0) as usize
+    }
+
+    /// Client point just below the caret (where a keyboard-opened menu goes).
+    pub fn caret_point(&self) -> (i32, i32) {
+        let p = self.caret();
+        let x = self.msg(SCI_POINTXFROMPOSITION, 0, p as isize) as i32;
+        let y = self.msg(SCI_POINTYFROMPOSITION, 0, p as isize) as i32;
+        let line = self.msg(SCI_LINEFROMPOSITION, p, 0) as usize;
+        (x, y + self.msg(SCI_TEXTHEIGHT, line, 0) as i32)
     }
 
     /// The URL under byte position `pos`, if any.

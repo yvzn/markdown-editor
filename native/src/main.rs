@@ -20,6 +20,7 @@ mod panels;
 mod paste;
 mod sci;
 mod settings;
+mod spell;
 mod theme;
 mod win;
 

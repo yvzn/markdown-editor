@@ -28,6 +28,7 @@ use crate::paste;
 use crate::panels::{OutlinePanel, SearchPanel, TreePanel};
 use crate::sci::{self, Editor};
 use crate::settings::Settings;
+use crate::spell::{self, Spell};
 use crate::theme::{self, Palette, ThemePref};
 use crate::win::*;
 
@@ -50,6 +51,7 @@ const T_LOCK: usize = 5;
 pub const T_SEARCH: usize = 6;
 const T_SNAPSHOT: usize = 7;
 const T_CODE: usize = 9;
+const T_SPELL: usize = 10;
 pub const T_SEARCH_FLUSH: usize = 8;
 
 pub const ID_SEARCH_EDIT: usize = 101;
@@ -90,6 +92,7 @@ pub enum Hit {
     Title,
     Mode(Mode),
     Theme,
+    Spelling,
     Tab(Panel),
     WsMenu,
     NewFile,
@@ -158,6 +161,7 @@ pub struct App {
 
     pub editor: Editor,
     code_colours: CodeColours,
+    spell: Spell,
     pub preview: HWND,
     pub tree: TreePanel,
     pub search: SearchPanel,
@@ -429,6 +433,7 @@ impl App {
             let mut editor = Editor::create(hwnd);
             let zoom = settings.get("zoom").and_then(|v| v.parse::<f32>().ok()).map_or(1.0, clamp_zoom);
             editor.zoom = zoom;
+            let spell = Spell::new(settings.get("spellcheck") != Some("0"), settings.get("spellLanguages").unwrap_or(spell::DEFAULT_LANGUAGES));
             let preview = ffi::pv_create(hwnd);
             SetWindowLongPtrW(preview, GWL_STYLE, GetWindowLongPtrW(preview, GWL_STYLE) | WS_CLIPSIBLINGS as isize);
             let a = Box::new(App {
@@ -441,6 +446,7 @@ impl App {
                 input_brush: std::ptr::null_mut(),
                 editor,
                 code_colours: CodeColours::default(),
+                spell,
                 preview,
                 tree: TreePanel::create(hwnd),
                 search: SearchPanel::create(hwnd),
@@ -555,6 +561,217 @@ impl App {
         self.settings.set("theme", p.as_str());
         self.apply_theme();
     }
+
+    /// Squiggle the misspelled words on screen (Markdown files only, when enabled).
+    fn paint_spelling(&mut self) {
+        let prose = self.current.as_deref().is_some_and(is_markdown);
+        let was = self.spell.enabled;
+        self.spell.enabled = was && prose;
+        // The word being typed is left alone, unless the editor does not have the focus.
+        let caret = self.editor.has_focus().then(|| self.editor.caret());
+        let label = (self.spell.label(), self.spell.missing());
+        self.spell.paint(&self.editor, caret);
+        self.spell.enabled = was;
+        // The first check loads the dictionaries, which may change the toolbar's label.
+        if (self.spell.label(), self.spell.missing()) != label {
+            self.invalidate();
+        }
+    }
+
+    fn set_spelling(&mut self, on: bool) {
+        self.spell.enabled = on;
+        self.settings.set("spellcheck", if on { "1" } else { "0" });
+        self.respell();
+    }
+
+    /// Drop every squiggle and check the lines on screen again (after a settings change).
+    fn respell(&mut self) {
+        let len = self.editor.msg(sci::SCI_GETLENGTH, 0, 0) as usize;
+        self.editor.clear_spelling(0, len);
+        self.paint_spelling();
+        self.invalidate();
+    }
+
+    /// The toolbar's spelling menu: on / off, the languages Windows can check, and a way to
+    /// get more. `at`: screen point of the menu's top-right corner.
+    fn spelling_menu(&mut self, at: POINT) {
+        let langs = self.spell.available();
+        let in_use = langs.iter().filter(|l| l.2).count();
+        let cmd = unsafe {
+            let m = CreatePopupMenu();
+            let add = |flags: u32, id: usize, label: &str| {
+                let l = wide(label);
+                AppendMenuW(m, flags, id, l.as_ptr());
+            };
+            // In Preview nothing shows: say where it does, right where the question comes up.
+            if self.effective_mode() == Mode::Preview {
+                add(MF_STRING | MF_GRAYED, 0, "Shown in Code and Split views");
+                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+            }
+            add(MF_STRING | if self.spell.enabled { MF_CHECKED } else { 0 } | if langs.is_empty() { MF_GRAYED } else { 0 }, 1, "Check spelling");
+            AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+            if langs.is_empty() {
+                add(MF_STRING | MF_GRAYED, 0, "No dictionary installed");
+            }
+            for (i, (tag, name, on)) in langs.iter().enumerate() {
+                // The last language in use can't be unchecked: "Check spelling" turns it all off.
+                let flags = MF_STRING | if *on { MF_CHECKED } else { 0 } | if !self.spell.enabled || (*on && in_use == 1) { MF_GRAYED } else { 0 };
+                add(flags, 10 + i, &format!("{name}\t{tag}"));
+            }
+            AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+            add(MF_STRING, 2, "Add languages in Windows Settings\u{2026}");
+            let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTALIGN, at.x, at.y, 0, self.hwnd, std::ptr::null()) as usize;
+            DestroyMenu(m);
+            cmd
+        };
+        match cmd {
+            1 => self.set_spelling(!self.spell.enabled),
+            2 => {
+                let (op, w) = (wide("open"), wide("ms-settings:regionlanguage"));
+                unsafe { ShellExecuteW(self.hwnd, op.as_ptr(), w.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+            }
+            c if c >= 10 => {
+                let Some((tag, _, on)) = langs.get(c - 10) else { return };
+                // Keep the order the languages were asked in; a new one goes last.
+                let mut tags: Vec<String> = langs.iter().filter(|l| l.2).map(|l| l.0.clone()).collect();
+                let order: Vec<String> = self.spell.languages().split(',').map(|t| t.trim().split('-').next().unwrap_or("").to_ascii_lowercase()).collect();
+                tags.sort_by_key(|t| order.iter().position(|o| t.to_ascii_lowercase().starts_with(&format!("{o}-")) || t.eq_ignore_ascii_case(o)).unwrap_or(usize::MAX));
+                if *on {
+                    tags.retain(|t| t != tag);
+                } else {
+                    tags.push(tag.clone());
+                }
+                let joined = tags.join(",");
+                self.settings.set("spellLanguages", &joined);
+                self.spell.set_languages(&joined);
+                self.respell();
+            }
+            _ => {}
+        }
+    }
+
+    /// The editor's context menu: spelling suggestions for a misspelled word, the usual
+    /// editing commands and the spell-check toggle. `lp` is WM_CONTEXTMENU's screen point
+    /// (-1 when opened from the keyboard: the menu goes under the caret).
+    fn editor_menu(&mut self, lp: LPARAM) {
+        let ed = &self.editor;
+        let (pt, client) = if lp == -1 {
+            let (x, y) = ed.caret_point();
+            let mut p = POINT { x, y };
+            unsafe { ClientToScreen(ed.hwnd, &mut p) };
+            (p, None)
+        } else {
+            let screen = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
+            let mut p = screen;
+            unsafe { ScreenToClient(ed.hwnd, &mut p) };
+            (screen, Some((p.x, p.y)))
+        };
+        let word = if self.spell.enabled { ed.misspelled_at(ed.pos_at(client)) } else { None };
+        let suggestions = match &word {
+            Some((_, _, w)) => self.spell.suggest(w, 6),
+            None => Vec::new(),
+        };
+        // Every prose occurrence of the same misspelling (exact match, case included).
+        let same: Vec<(usize, usize)> = match &word {
+            Some((_, _, w)) => {
+                let text = self.editor.text();
+                spell::prose_words(&text, 0, text.len()).into_iter().filter(|&(s, e)| text[s..e] == **w).collect()
+            }
+            None => Vec::new(),
+        };
+        let ed = &self.editor;
+        let has_sel = ed.msg(sci::SCI_GETSELECTIONEMPTY, 0, 0) == 0;
+        let can_undo = ed.msg(sci::SCI_CANUNDO, 0, 0) != 0;
+        let can_redo = ed.msg(sci::SCI_CANREDO, 0, 0) != 0;
+        let can_paste = ed.msg(sci::SCI_CANPASTE, 0, 0) != 0;
+        let md = self.current.as_deref().is_some_and(is_markdown);
+        let langs = if md { self.spell.active_languages() } else { Vec::new() };
+        let gray = |on: bool| if on { 0 } else { MF_GRAYED };
+        let cmd = unsafe {
+            let m = CreatePopupMenu();
+            let add = |flags: u32, id: usize, label: &str| {
+                let l = wide(label);
+                AppendMenuW(m, flags, id, l.as_ptr());
+            };
+            let sep = || AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+            if word.is_some() {
+                if suggestions.is_empty() {
+                    add(MF_STRING | MF_GRAYED, 0, "No suggestions");
+                }
+                for (i, s) in suggestions.iter().enumerate() {
+                    add(MF_STRING, 100 + i, &s.replace('&', "&&"));
+                }
+                // The same typo elsewhere in the document: fix every one with one pick.
+                if same.len() > 1 && !suggestions.is_empty() {
+                    let sub = CreatePopupMenu();
+                    for (i, s) in suggestions.iter().enumerate() {
+                        let l = wide(&s.replace('&', "&&"));
+                        AppendMenuW(sub, MF_STRING, 200 + i, l.as_ptr());
+                    }
+                    let l = wide(&format!("Fix all {} occurrences", same.len()));
+                    AppendMenuW(m, MF_POPUP, sub as usize, l.as_ptr());
+                }
+                sep();
+                add(MF_STRING, 1, "Add to dictionary");
+                add(MF_STRING, 2, "Ignore");
+                add(MF_STRING, 20, "Turn off spell checking");
+                sep();
+            }
+            add(MF_STRING | gray(can_undo), 10, "Undo\tCtrl+Z");
+            add(MF_STRING | gray(can_redo), 11, "Redo\tCtrl+Y");
+            sep();
+            add(MF_STRING | gray(has_sel), 12, "Cut\tCtrl+X");
+            add(MF_STRING | gray(has_sel), 13, "Copy\tCtrl+C");
+            add(MF_STRING | gray(can_paste), 14, "Paste\tCtrl+V");
+            add(MF_STRING | gray(has_sel), 15, "Delete\tDel");
+            sep();
+            add(MF_STRING, 16, "Select all\tCtrl+A");
+            if word.is_none() && md {
+                sep();
+                if langs.is_empty() {
+                    add(MF_STRING | MF_GRAYED, 0, "Check spelling (no dictionary installed)");
+                } else {
+                    add(MF_STRING | if self.spell.enabled { MF_CHECKED } else { 0 }, 20, &format!("Check spelling ({})", langs.join(", ")));
+                }
+            }
+            let cmd = TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, 0, self.hwnd, std::ptr::null()) as usize;
+            DestroyMenu(m);
+            cmd
+        };
+        let ed = &self.editor;
+        match cmd {
+            1 | 2 => {
+                if let Some((_, _, w)) = &word {
+                    if cmd == 1 {
+                        self.spell.add(w)
+                    } else {
+                        self.spell.ignore(w)
+                    }
+                }
+                self.paint_spelling();
+            }
+            10 => _ = ed.msg(sci::SCI_UNDO, 0, 0),
+            11 => _ = ed.msg(sci::SCI_REDO, 0, 0),
+            12 => _ = ed.msg(sci::SCI_CUT, 0, 0),
+            13 => _ = ed.msg(sci::SCI_COPY, 0, 0),
+            14 => self.smart_paste(),
+            15 => _ = ed.msg(sci::SCI_CLEAR, 0, 0),
+            16 => _ = ed.msg(sci::SCI_SELECTALL, 0, 0),
+            20 => self.set_spelling(!self.spell.enabled),
+            c if c >= 200 => {
+                if let Some(r) = suggestions.get(c - 200) {
+                    self.editor.replace_ranges(&same, r);
+                }
+            }
+            c if c >= 100 => {
+                if let (Some((s, e, _)), Some(r)) = (&word, suggestions.get(c - 100)) {
+                    self.editor.replace_range(*s, *e, r);
+                }
+            }
+            _ => {}
+        }
+    }
+
 
     fn theme_menu(&mut self, at: POINT) {
         unsafe {
@@ -794,7 +1011,8 @@ impl App {
         let (cb, cf) = (self.history.can_back(), self.history.can_fwd());
         self.button(p, back_r, Hit::Back, "\u{E72B}", self.fonts.icon, false, cb, pal.bar);
         self.button(p, fwd_r, Hit::Forward, "\u{E72A}", self.fonts.icon, false, cf, pal.bar);
-        self.place_tips(&back_r, &fwd_r);
+        self.place_tip(1, &back_r);
+        self.place_tip(2, &fwd_r);
 
         let theme_r = rect(tb.right - self.px(8.0) - ib, ty, tb.right - self.px(8.0), ty + ib);
         let glyph = match self.pref {
@@ -803,10 +1021,39 @@ impl App {
             ThemePref::System => "\u{E7F4}",
         };
         self.button(p, theme_r, Hit::Theme, glyph, self.fonts.icon, false, true, pal.bar);
-        let sep_x = theme_r.left - self.px(8.0);
+
+        // Spelling: says what it does and its state in plain words ("Spelling: FR · EN" /
+        // "Spelling: off"), next to the theme as the other view setting. Dimmed outside Markdown.
+        let md = self.current.as_deref().is_some_and(is_markdown);
+        // The "ABC ✓" proofing glyph Office uses, then the languages ("FR · EN"), or "Off".
+        const SPELL_GLYPH: &str = "\u{F87B}";
+        let spell_label = if !self.spell.enabled {
+            "Off".to_string()
+        } else if self.spell.missing() {
+            "None".to_string()
+        } else {
+            self.spell.label()
+        };
+        let gw = p.text_width(SPELL_GLYPH, self.fonts.icon);
+        let lw = p.text_width(&spell_label, self.fonts.ui);
+        let (pad, gap) = (self.px(10.0), self.px(6.0));
+        let sw = pad + gw + gap + lw + pad;
+        let spell_r = rect(theme_r.left - self.px(4.0) - sw, ty, theme_r.left - self.px(4.0), ty + ib);
+        // Dimmed in Preview too (nothing is underlined there), but still clickable.
+        let spell_on = md && self.spell.enabled && !self.spell.missing() && self.effective_mode() != Mode::Preview;
+        let hover = self.hover == Some(Hit::Spelling) && md;
+        if hover {
+            p.round_fill(&spell_r, pal.hover_bar, self.px(8.0));
+        }
+        let fg = if spell_on { pal.fg } else { pal.fg_dim };
+        let gx = spell_r.left + pad;
+        p.text(SPELL_GLYPH, &rect(gx, ty, gx + gw, ty + ib), fg, self.fonts.icon, CENTER_MID);
+        p.text(&spell_label, &rect(gx + gw + gap, ty, spell_r.right, ty + ib), fg, self.fonts.ui, LEFT_MID);
+        self.hits.push((spell_r, Hit::Spelling));
+        self.place_tip(3, &spell_r);
+        let sep_x = spell_r.left - self.px(8.0);
         p.fill(&rect(sep_x, ty + self.px(6.0), sep_x + 1, ty + ib - self.px(6.0)), pal.border_strong);
 
-        let md = self.current.as_deref().is_some_and(is_markdown);
         let mut x = sep_x - self.px(8.0);
         let mode = self.effective_mode();
         for (m, label) in [(Mode::Preview, "Preview"), (Mode::Split, "Split"), (Mode::Code, "Code")] {
@@ -886,6 +1133,14 @@ impl App {
             Hit::Forward => self.navigate(false, 1),
             Hit::Title => self.start_rename(),
             Hit::Mode(m) => self.set_mode(m),
+            Hit::Spelling => {
+                if self.current.as_deref().is_some_and(is_markdown) {
+                    let r = self.hits.iter().find(|(_, h)| *h == Hit::Spelling).map(|(r, _)| *r).unwrap_or(self.lay.toolbar);
+                    let mut pt = POINT { x: r.right, y: self.lay.toolbar.bottom };
+                    unsafe { ClientToScreen(self.hwnd, &mut pt) };
+                    self.spelling_menu(pt);
+                }
+            }
             Hit::Theme => {
                 let mut pt = POINT { x: self.lay.toolbar.right - self.px(8.0), y: self.lay.toolbar.bottom };
                 unsafe { ClientToScreen(self.hwnd, &mut pt) };
@@ -1261,18 +1516,29 @@ impl App {
     }
 
     /// Tooltips over the painted arrows name where they lead.
-    fn place_tips(&self, back: &RECT, fwd: &RECT) {
-        for (id, r) in [(1usize, back), (2, fwd)] {
-            let mut ti: TTTOOLINFOW = unsafe { std::mem::zeroed() };
-            ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
-            ti.hwnd = self.hwnd;
-            ti.uId = id;
-            ti.rect = *r;
-            send(self.tip, TTM_NEWTOOLRECTW, 0, &ti as *const _ as isize);
-        }
+    fn place_tip(&self, id: usize, r: &RECT) {
+        let mut ti: TTTOOLINFOW = unsafe { std::mem::zeroed() };
+        ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        ti.hwnd = self.hwnd;
+        ti.uId = id;
+        ti.rect = *r;
+        send(self.tip, TTM_NEWTOOLRECTW, 0, &ti as *const _ as isize);
     }
 
     fn tip_text(&mut self, id: usize) -> *mut u16 {
+        if id == 3 {
+            let s = if !self.current.as_deref().is_some_and(is_markdown) {
+                "Spell checking applies to Markdown files".to_string()
+            } else if self.spell.enabled && self.effective_mode() == Mode::Preview {
+                "Spelling is underlined in Code and Split views".to_string()
+            } else if self.spell.enabled {
+                "Spell checking is on (click to turn off or change languages)".to_string()
+            } else {
+                "Spell checking is off (click to turn on)".to_string()
+            };
+            self.tip_text = wide(&s);
+            return self.tip_text.as_mut_ptr();
+        }
         let back = id == 1;
         let (verb, keys) = if back { ("Back", "Alt+\u{2190}") } else { ("Forward", "Alt+\u{2192}") };
         let s = match self.history.list(back).next() {
@@ -1625,6 +1891,8 @@ impl App {
         self.layout();
         self.refresh_preview(true);
         self.invalidate();
+        // The editor may have been hidden (and sized to nothing) while the text changed.
+        unsafe { SetTimer(self.hwnd, T_SPELL, 50, None) };
     }
 
     pub fn show_panel(&mut self, p: Panel) {
@@ -1914,7 +2182,10 @@ impl App {
             match n.code {
                 sci::SCN_MODIFIED if n.modification_type & (sci::SC_MOD_INSERTTEXT | sci::SC_MOD_DELETETEXT) != 0 => {
                     self.editor.mark_urls();
-                    unsafe { SetTimer(self.hwnd, T_CODE, 150, None) };
+                    unsafe {
+                        SetTimer(self.hwnd, T_CODE, 150, None);
+                        SetTimer(self.hwnd, T_SPELL, 300, None);
+                    }
                     self.on_change();
                 }
                 sci::SCN_DWELLSTART => self.editor.show_url_tip(n.x, n.y),
@@ -1924,7 +2195,15 @@ impl App {
                         self.open_external(&url);
                     }
                 }
-                sci::SCN_UPDATEUI if n.updated & sci::SC_UPDATE_V_SCROLL != 0 => self.on_editor_scroll(),
+                sci::SCN_UPDATEUI => {
+                    if n.updated & sci::SC_UPDATE_V_SCROLL != 0 {
+                        self.on_editor_scroll();
+                        unsafe { SetTimer(self.hwnd, T_SPELL, 150, None) };
+                    } else if n.updated & sci::SC_UPDATE_SELECTION != 0 && self.spell.skipped_at.is_some_and(|p| p != self.editor.caret()) {
+                        // The caret left the word it was typing: check that one too.
+                        unsafe { SetTimer(self.hwnd, T_SPELL, 150, None) };
+                    }
+                }
                 _ => {}
             }
             return None;
@@ -2079,6 +2358,10 @@ impl App {
                 Some(0)
             }
             WM_NOTIFY => self.on_notify(lp as *const NMHDR),
+            sci::WM_EDITOR_MENU => {
+                self.editor_menu(lp);
+                Some(0)
+            }
             WM_COMMAND => {
                 let code = ((wp >> 16) & 0xffff) as u32;
                 let id = wp & 0xffff;
@@ -2110,6 +2393,10 @@ impl App {
                     T_CODE => {
                         unsafe { KillTimer(self.hwnd, T_CODE) };
                         self.code_colours.paint(&self.editor, self.pal.dark);
+                    }
+                    T_SPELL => {
+                        unsafe { KillTimer(self.hwnd, T_SPELL) };
+                        self.paint_spelling();
                     }
                     T_TOAST => {
                         unsafe { KillTimer(self.hwnd, T_TOAST) };
@@ -2273,7 +2560,7 @@ fn create_tip(owner: HWND) -> HWND {
             GetModuleHandleW(std::ptr::null()),
             std::ptr::null(),
         );
-        for id in [1usize, 2] {
+        for id in [1usize, 2, 3] {
             let mut ti: TTTOOLINFOW = std::mem::zeroed();
             ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
             ti.uFlags = TTF_SUBCLASS;

@@ -20,6 +20,7 @@ What you get:
 - Quick file switching with Ctrl+P (or Ctrl+O), autosave, and reloading when files change on disk
 - Smart paste: content copied from web pages, Word, Outlook or Google Docs becomes Markdown, and pasted screenshots are saved to `images/` and linked (Ctrl+Shift+V pastes plain text)
 - Rich copy: Ctrl+C in the preview copies the selection with its formatting, and Ctrl+Shift+C in the editor copies the selected Markdown as rich text, ready for Word, Outlook or Teams
+- Spell checking in French and English with the Windows spell checker (no dictionaries to install): misspelled words are underlined, and a right-click offers suggestions, "Add to dictionary" and a toggle. Code, links and file names are skipped
 - Light and dark themes
 - Mermaid diagrams viewable in your browser, offline (mermaid.js is bundled)
 
